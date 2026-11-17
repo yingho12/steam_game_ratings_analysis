@@ -1,0 +1,8 @@
+steam_games.csv
+steam_results_summary.txt
+*.html
+*.pdf
+.Rhistory
+.RData
+.Rproj.user/
+.DS_Store

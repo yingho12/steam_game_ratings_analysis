@@ -1,0 +1,547 @@
+---
+title: "Steam Game Ratings and Estimated Ownership"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    code_folding: hide
+    self_contained: true
+---
+
+# Project Overview
+
+This project looks at how Steam review scores relate to estimated game ownership. I use the share of positive reviews as the rating measure and the midpoint of each ownership range as the ownership estimate.
+
+Games with very few reviews can have extreme scores. I use **100+ reviews** for the main analysis, **20+ and 50+** to check the results, and the original **20,000 games** for EDA.
+
+Data: [Steam Games Dataset (SteamSpy Version)](https://www.kaggle.com/datasets/fronkongames/steam-games-dataset).
+
+# 1. Setup and Data Preparation
+
+```{r setup, message=FALSE, warning=FALSE}
+library(readr)
+library(dplyr)
+library(ggplot2)
+
+set.seed(100)
+theme_set(theme_bw(base_size = 12))
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.align = "center")
+
+# The source header combines "Discount" and "DLC count". Supply all 40 names.
+steam_columns <- c(
+  "AppID", "Name", "Release date", "Estimated owners", "Peak CCU",
+  "Required age", "Price", "Discount", "DLC count", "About the game",
+  "Supported languages", "Full audio languages", "Reviews", "Header image",
+  "Website", "Support url", "Support email", "Windows", "Mac", "Linux",
+  "Metacritic score", "Metacritic url", "User score", "Positive", "Negative",
+  "Score rank", "Achievements", "Recommendations", "Notes",
+  "Average playtime forever", "Average playtime two weeks",
+  "Median playtime forever", "Median playtime two weeks", "Developers",
+  "Publishers", "Categories", "Genres", "Tags", "Screenshots", "Movies"
+)
+
+steam_raw <- read_csv(
+  "steam_games.csv", col_names = steam_columns, skip = 1,
+  col_types = cols(`Score rank` = col_character()), show_col_types = FALSE
+)
+
+cat("Raw rows:", nrow(steam_raw), "\n")
+cat("Columns:", ncol(steam_raw), "\n")
+cat("Parsing problems:", nrow(problems(steam_raw)), "\n")
+stopifnot(ncol(steam_raw) == 40, nrow(problems(steam_raw)) == 0)
+
+# Use the midpoint of each estimated owner range.
+parse_owners <- function(x) {
+  x2 <- gsub(",", "", x)
+  pat <- "([0-9]+)[[:space:]]*-[[:space:]]*([0-9]+)"
+  low <- suppressWarnings(as.numeric(sub(pat, "\\1", x2)))
+  high <- suppressWarnings(as.numeric(sub(pat, "\\2", x2)))
+  mid <- ifelse(is.finite(low) & is.finite(high), (low + high) / 2, NA_real_)
+  tibble(owners_low = low, owners_high = high, owners_mid = mid)
+}
+
+owners_parsed <- parse_owners(steam_raw$`Estimated owners`)
+
+steam_all <- bind_cols(steam_raw, owners_parsed) %>%
+  mutate(
+    total_reviews = ifelse(is.na(Positive) | is.na(Negative),
+                           NA_real_, Positive + Negative),
+    pos_share = ifelse(!is.na(total_reviews) & total_reviews > 0,
+                       Positive / total_reviews, NA_real_),
+    price_usd = suppressWarnings(as.numeric(Price))
+  ) %>%
+  filter(
+    !is.na(owners_mid), !is.na(pos_share), !is.na(price_usd),
+    owners_mid > 0, pos_share >= 0, pos_share <= 1,
+    price_usd >= 0, price_usd <= 120, total_reviews > 0
+  )
+
+# Sample once, then filter by review count.
+if (nrow(steam_all) > 20000) steam_all <- sample_n(steam_all, 20000)
+steam_20 <- steam_all %>% filter(total_reviews >= 20)
+steam_50 <- steam_all %>% filter(total_reviews >= 50)
+steam_main <- steam_all %>% filter(total_reviews >= 100)
+
+stopifnot(nrow(steam_main) > 100, nrow(steam_20) >= nrow(steam_main))
+
+sample_sizes <- tibble(
+  Sample = c("All games (EDA)", "20+ reviews (check)",
+             "50+ reviews (check)", "100+ reviews (main)"),
+  Games = c(nrow(steam_all), nrow(steam_20), nrow(steam_50), nrow(steam_main)),
+  Perfect_ratings = c(sum(steam_all$pos_share == 1), sum(steam_20$pos_share == 1),
+                      sum(steam_50$pos_share == 1), sum(steam_main$pos_share == 1))
+)
+knitr::kable(sample_sizes, caption = "Samples created from the same 20,000 games")
+summary(select(steam_all, owners_mid, pos_share, price_usd, total_reviews))
+```
+
+# 2. Exploratory Data Analysis (EDA)
+
+These plots use the original 20,000-game sample, before the review-count filters.
+
+```{r eda, fig.width=7, fig.height=4.2}
+# Log scale for the wide ownership range.
+p1 <- ggplot(steam_all, aes(x = log10(owners_mid))) +
+  geom_histogram(binwidth = 0.25, boundary = 0, fill = "grey30") +
+  labs(title = "Distribution of Estimated Owners",
+       x = "log10(estimated owners)", y = "Count")
+print(p1)
+
+ggplot(steam_all, aes(x = pos_share)) +
+  geom_histogram(bins = 60) +
+  labs(title = "Positive Review Share", x = "Positive review share", y = "Count")
+
+ggplot(steam_all, aes(x = price_usd)) +
+  geom_histogram(bins = 60) +
+  labs(title = "Game Prices", x = "Price (USD)", y = "Count")
+
+# Dashed lines show the three review-count cutoffs.
+ggplot(steam_all, aes(x = log10(total_reviews))) +
+  geom_histogram(bins = 50) +
+  geom_vline(xintercept = log10(c(20, 50, 100)), linetype = "dashed") +
+  labs(title = "Number of Reviews per Game",
+       subtitle = "Dashed lines mark 20, 50 and 100 reviews",
+       x = "log10(total reviews)", y = "Count")
+```
+
+The horizontal bands in the scatter plots come from the dataset's ownership ranges. Games in the same range share one midpoint.
+
+# 3. Regression Models
+
+I compare a linear model, a quadratic model, and a quadratic model with price. The models are fitted on both the 100+ and 20+ review samples.
+
+```{r regression-models}
+fit_models <- function(df) {
+  list(
+    Linear = lm(log10(owners_mid) ~ pos_share, data = df),
+    Quadratic = lm(log10(owners_mid) ~ pos_share + I(pos_share^2), data = df),
+    `Quadratic + Price` = lm(
+      log10(owners_mid) ~ pos_share + I(pos_share^2) + price_usd, data = df
+    )
+  )
+}
+
+models_main <- fit_models(steam_main)
+models_20 <- fit_models(steam_20)
+
+# Main-sample models.
+m1 <- models_main$Linear
+m2 <- models_main$Quadratic
+m3 <- models_main$`Quadratic + Price`
+m3_20 <- models_20$`Quadratic + Price`
+
+cat("MAIN SAMPLE (100+ REVIEWS) - LINEAR\n"); print(summary(m1))
+cat("MAIN SAMPLE (100+ REVIEWS) - QUADRATIC\n"); print(summary(m2))
+cat("MAIN SAMPLE (100+ REVIEWS) - QUADRATIC + PRICE\n"); print(summary(m3))
+cat("CHECK SAMPLE (20+ REVIEWS) - QUADRATIC + PRICE\n"); print(summary(m3_20))
+```
+
+## 3.1 Model Comparison
+
+The metrics are based on the fitted data. AIC is compared only within the same sample.
+
+```{r model-comparison}
+get_model_stats <- function(models, sample_name) {
+  bind_rows(lapply(names(models), function(name) {
+    m <- models[[name]]
+    s <- summary(m)
+    tibble(
+      Sample = sample_name, Model = name, R_squared = s$r.squared,
+      Adjusted_R_squared = s$adj.r.squared,
+      AIC = AIC(m), RMSE_log10 = sqrt(mean(residuals(m)^2))
+    )
+  })) %>% mutate(Delta_AIC = AIC - min(AIC)) %>% arrange(AIC)
+}
+
+model_comparison <- bind_rows(
+  get_model_stats(models_main, "100+ reviews (main)"),
+  get_model_stats(models_20, "20+ reviews (check)")
+)
+knitr::kable(model_comparison, digits = 4, caption = "Regression comparison within each sample")
+
+# Only show a fitted peak when it falls inside the rating range.
+get_quadratic_result <- function(m, sample_name, model_name) {
+  b1 <- unname(coef(m)[["pos_share"]])
+  b2 <- unname(coef(m)[["I(pos_share^2)"]])
+  vertex <- if (is.finite(b2) && b2 != 0) -b1 / (2 * b2) else NA_real_
+  tibble(
+    Sample = sample_name, Model = model_name,
+    Square_coefficient = b2,
+    Square_p_value = coef(summary(m))["I(pos_share^2)", "Pr(>|t|)"],
+    Fitted_peak = ifelse(b2 < 0 && !is.na(vertex) && vertex >= 0 && vertex <= 1,
+                         vertex, NA_real_)
+  )
+}
+
+quadratic_results <- bind_rows(
+  get_quadratic_result(models_main$Quadratic, "100+ reviews (main)", "Quadratic"),
+  get_quadratic_result(m3, "100+ reviews (main)", "Quadratic + Price"),
+  get_quadratic_result(models_20$Quadratic, "20+ reviews (check)", "Quadratic"),
+  get_quadratic_result(m3_20, "20+ reviews (check)", "Quadratic + Price")
+)
+knitr::kable(quadratic_results, digits = 4, caption = "Quadratic terms and fitted peaks")
+```
+
+## 3.2 Rating and Ownership Plots
+
+```{r regression-plots, fig.width=7, fig.height=4.3}
+plot_regression <- function(df, sample_name) {
+  ggplot(df, aes(x = pos_share, y = log10(owners_mid))) +
+    geom_point(alpha = 0.10, size = 0.7) +
+    geom_smooth(method = "lm", formula = y ~ x, se = FALSE, linewidth = 0.8) +
+    geom_smooth(method = "lm", formula = y ~ poly(x, 2, raw = TRUE),
+                se = FALSE, linetype = 2, linewidth = 0.9) +
+    labs(title = paste("Review Share and Estimated Ownership -", sample_name),
+         subtitle = "Solid = linear fit; dashed = quadratic fit",
+         x = "Positive review share", y = "log10(estimated owners)")
+}
+print(plot_regression(steam_main, "100+ reviews (main)"))
+print(plot_regression(steam_20, "20+ reviews (check)"))
+```
+
+# 4. Rating Band Analysis
+
+Exact 100% ratings are kept in a separate band.
+
+```{r rating-bands, fig.width=9, fig.height=6}
+rating_levels <- c(
+  "<0.50", "0.50-<0.60", "0.60-<0.70", "0.70-<0.80",
+  "0.80-<0.85", "0.85-<0.90", "0.90-<0.95", "0.95-<1.00", "1.00 exactly"
+)
+
+add_rating_band <- function(df) {
+  df %>% mutate(rating_band = factor(case_when(
+    pos_share == 1 ~ "1.00 exactly",
+    pos_share >= 0.95 ~ "0.95-<1.00",
+    pos_share >= 0.90 ~ "0.90-<0.95",
+    pos_share >= 0.85 ~ "0.85-<0.90",
+    pos_share >= 0.80 ~ "0.80-<0.85",
+    pos_share >= 0.70 ~ "0.70-<0.80",
+    pos_share >= 0.60 ~ "0.60-<0.70",
+    pos_share >= 0.50 ~ "0.50-<0.60",
+    TRUE ~ "<0.50"
+  ), levels = rating_levels))
+}
+
+get_rating_summary <- function(df, sample_name) {
+  add_rating_band(df) %>%
+    group_by(rating_band) %>%
+    summarise(
+      Games = n(), Median_reviews = median(total_reviews),
+      Mean_log_owners = mean(log10(owners_mid)),
+      Pct_midpoint_50k_plus = 100 * mean(owners_mid >= 50000),
+      .groups = "drop"
+    ) %>% mutate(Sample = sample_name, .before = 1)
+}
+
+rating_summary <- bind_rows(
+  get_rating_summary(steam_main, "100+ reviews (main)"),
+  get_rating_summary(steam_20, "20+ reviews (check)")
+)
+knitr::kable(rating_summary, digits = 3, caption = "Rating bands in the main and check samples")
+
+ggplot(rating_summary, aes(x = rating_band, y = Mean_log_owners, group = 1)) +
+  geom_line() + geom_point(aes(size = Games)) +
+  facet_wrap(~ Sample, ncol = 1, scales = "fixed") +
+  labs(title = "Mean Log Ownership by Rating Band",
+       subtitle = "Point size represents the number of games; exact 100% is separate",
+       x = "Positive review share", y = "Mean log10(estimated owners)") +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+```
+
+# 5. LOESS Trend
+
+I group ratings into 0.02-wide intervals and weight the LOESS line by game count.
+
+```{r loess-trend, fig.width=8, fig.height=6}
+get_loess_points <- function(df, sample_name) {
+  df %>%
+    mutate(rating_step = if_else(pos_share == 1, 50L,
+                                 as.integer(floor(pos_share / 0.02)))) %>%
+    group_by(rating_step) %>%
+    summarise(
+      rating = mean(pos_share), Mean_log_owners = mean(log10(owners_mid)),
+      Games = n(), .groups = "drop"
+    ) %>% mutate(Sample = sample_name, .before = 1)
+}
+
+loess_points <- bind_rows(
+  get_loess_points(steam_main, "100+ reviews (main)"),
+  get_loess_points(steam_20, "20+ reviews (check)")
+)
+
+ggplot(loess_points, aes(x = rating, y = Mean_log_owners)) +
+  geom_point(aes(size = Games), alpha = 0.6) +
+  geom_smooth(aes(weight = Games), method = "loess", formula = y ~ x,
+              span = 0.75, se = FALSE) +
+  facet_wrap(~ Sample, ncol = 1) +
+  labs(title = "LOESS Trend by Review Share",
+       subtitle = "Grouped means, weighted by game count",
+       x = "Positive review share", y = "Mean log10(estimated owners)")
+```
+
+# 6. Piecewise Regression
+
+I search for one breakpoint using AIC, with price included in the model. Each side must contain at least 5% of the sample or 100 games, whichever is larger.
+
+```{r piecewise, fig.width=7, fig.height=4.5}
+candidate_breaks <- seq(0.20, 0.95, by = 0.01)
+
+fit_piecewise <- function(df, k) {
+  temp <- df %>% mutate(hinge = pmax(pos_share - k, 0))
+  lm(log10(owners_mid) ~ pos_share + hinge + price_usd, data = temp)
+}
+
+search_breakpoint <- function(df, sample_name) {
+  min_per_side <- max(100, ceiling(0.05 * nrow(df)))
+
+  tested <- bind_rows(lapply(candidate_breaks, function(k) {
+    n_left <- sum(df$pos_share <= k)
+    n_right <- sum(df$pos_share > k)
+    if (n_left < min_per_side || n_right < min_per_side) return(NULL)
+
+    m <- fit_piecewise(df, k)
+    b <- coef(m)
+    tibble(
+      Breakpoint = k, AIC = AIC(m), Left_games = n_left, Right_games = n_right,
+      Slope_before = unname(b[["pos_share"]]),
+      Slope_after = unname(b[["pos_share"]] + b[["hinge"]])
+    )
+  }))
+
+  if (nrow(tested) == 0) stop("No valid breakpoint candidates for ", sample_name)
+  best <- tested$Breakpoint[which.min(tested$AIC)]
+  final_model <- fit_piecewise(df, best)
+  result <- tested %>% filter(Breakpoint == best) %>%
+    mutate(
+      Sample = sample_name,
+      Adjusted_R_squared = summary(final_model)$adj.r.squared,
+      At_grid_boundary = best == min(tested$Breakpoint) || best == max(tested$Breakpoint),
+      .before = 1
+    )
+  list(result = result, tested = tested, model = final_model, best = best)
+}
+
+piece_main <- search_breakpoint(steam_main, "100+ reviews (main)")
+piece_20 <- search_breakpoint(steam_20, "20+ reviews (check)")
+breakpoint_summary <- bind_rows(piece_main$result, piece_20$result)
+knitr::kable(breakpoint_summary, digits = 4, caption = "Best searched breakpoints")
+
+knitr::kable(arrange(piece_main$tested, AIC) %>% head(5), digits = 4,
+             caption = "Five lowest AIC values: 100+ reviews")
+knitr::kable(arrange(piece_20$tested, AIC) %>% head(5), digits = 4,
+             caption = "Five lowest AIC values: 20+ reviews")
+
+plot_piecewise <- function(df, piece, sample_name) {
+  grid <- tibble(
+    pos_share = seq(min(df$pos_share), max(df$pos_share), length.out = 201),
+    price_usd = median(df$price_usd)
+  ) %>% mutate(hinge = pmax(pos_share - piece$best, 0))
+  grid$predicted <- predict(piece$model, newdata = grid)
+
+  ggplot(df, aes(x = pos_share, y = log10(owners_mid))) +
+    geom_point(alpha = 0.08, size = 0.7) +
+    geom_line(data = grid, aes(x = pos_share, y = predicted), linewidth = 1) +
+    geom_vline(xintercept = piece$best, linetype = "dashed") +
+    labs(title = paste("One-Breakpoint Model -", sample_name),
+         subtitle = "Price is held at the sample median; dashed line = searched breakpoint",
+         x = "Positive review share", y = "log10(estimated owners)")
+}
+print(plot_piecewise(steam_main, piece_main, "100+ reviews (main)"))
+print(plot_piecewise(steam_20, piece_20, "20+ reviews (check)"))
+```
+
+In the main sample, the selected breakpoint is **0.95**, the upper search boundary. It is not a precise turning point.
+
+# 7. Free-to-Play vs Paid Games
+
+I compare free-to-play and paid games using median ownership and ownership-range thresholds.
+
+```{r price-groups, fig.width=9, fig.height=6}
+add_price_group <- function(df) {
+  df %>% mutate(price_group = if_else(price_usd == 0, "Free-to-play", "Paid"))
+}
+
+get_price_summary <- function(df, sample_name) {
+  add_price_group(df) %>% group_by(price_group) %>% summarise(
+    Games = n(), Median_owners = median(owners_mid),
+    Mean_log_owners = mean(log10(owners_mid)),
+    Pct_midpoint_50k_plus = 100 * mean(owners_mid >= 50000),
+    Pct_midpoint_100k_plus = 100 * mean(owners_mid >= 100000),
+    Pct_midpoint_1m_plus = 100 * mean(owners_mid >= 1000000),
+    .groups = "drop"
+  ) %>% mutate(Sample = sample_name, .before = 1)
+}
+
+segment_summary <- bind_rows(
+  get_price_summary(steam_main, "100+ reviews (main)"),
+  get_price_summary(steam_20, "20+ reviews (check)")
+)
+knitr::kable(segment_summary, digits = 2, caption = "Free-to-play and paid games")
+
+price_plot_data <- bind_rows(
+  add_price_group(steam_main) %>% mutate(Sample = "100+ reviews (main)"),
+  add_price_group(steam_20) %>% mutate(Sample = "20+ reviews (check)")
+)
+
+ggplot(price_plot_data, aes(x = pos_share, y = log10(owners_mid))) +
+  geom_point(alpha = 0.08, size = 0.6) +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2, raw = TRUE),
+              se = FALSE, linewidth = 0.9) +
+  facet_grid(Sample ~ price_group) +
+  labs(title = "Rating and Ownership by Pricing Group",
+       subtitle = "Separate quadratic curves for each sample and pricing group",
+       x = "Positive review share", y = "log10(estimated owners)")
+
+get_segment_models <- function(df, sample_name) {
+  grouped <- add_price_group(df)
+  bind_rows(lapply(c("Free-to-play", "Paid"), function(group_name) {
+    part <- grouped %>% filter(price_group == group_name)
+    m <- lm(log10(owners_mid) ~ pos_share + I(pos_share^2), data = part)
+    tibble(Sample = sample_name, Group = group_name, Games = nrow(part),
+           Adjusted_R_squared = summary(m)$adj.r.squared,
+           Quadratic_coefficient = unname(coef(m)[["I(pos_share^2)"]]))
+  }))
+}
+segment_models <- bind_rows(
+  get_segment_models(steam_main, "100+ reviews (main)"),
+  get_segment_models(steam_20, "20+ reviews (check)")
+)
+knitr::kable(segment_models, digits = 4, caption = "Separate quadratic models by price group")
+```
+
+# 8. Review Count and Perfect Ratings
+
+This table separates exact 100% ratings and compares their review counts across samples.
+
+```{r perfect-rating-check}
+get_high_rating_check <- function(df, sample_name) {
+  df %>% mutate(rating_group = case_when(
+    pos_share == 1 ~ "1.00 exactly",
+    pos_share >= 0.95 ~ "0.95 to <1.00",
+    pos_share >= 0.90 ~ "0.90 to <0.95",
+    pos_share >= 0.85 ~ "0.85 to <0.90",
+    TRUE ~ "Below 0.85"
+  )) %>% group_by(rating_group) %>% summarise(
+    Games = n(), Median_reviews = median(total_reviews),
+    Pct_under_20_reviews = 100 * mean(total_reviews < 20),
+    Mean_log_owners = mean(log10(owners_mid)),
+    Pct_midpoint_50k_plus = 100 * mean(owners_mid >= 50000),
+    .groups = "drop"
+  ) %>% mutate(Sample = sample_name, .before = 1)
+}
+
+rating_check <- bind_rows(
+  get_high_rating_check(steam_all, "All games (EDA)"),
+  get_high_rating_check(steam_20, "20+ reviews (check)"),
+  get_high_rating_check(steam_main, "100+ reviews (main)")
+)
+knitr::kable(rating_check, digits = 2, caption = "Perfect ratings and review counts")
+```
+
+In the original sample, **92.9%** of perfect-rating games have fewer than 20 reviews. Only **five** perfect-rating games remain in the 100+ sample.
+
+# 9. Sensitivity Check (20, 50 and 100 Reviews)
+
+I repeat the Quadratic + Price model with 20, 50 and 100 minimum reviews, then check the effect of excluding exact 100% ratings.
+
+```{r sensitivity-check}
+sensitivity_samples <- list(
+  "20+ reviews" = steam_20,
+  "50+ reviews" = steam_50,
+  "100+ reviews (main)" = steam_main,
+  "100+ reviews, without exact 100%" = filter(steam_main, pos_share < 1)
+)
+
+get_sensitivity_stats <- function(df, sample_name) {
+  m <- lm(log10(owners_mid) ~ pos_share + I(pos_share^2) + price_usd, data = df)
+  b1 <- unname(coef(m)[["pos_share"]])
+  b2 <- unname(coef(m)[["I(pos_share^2)"]])
+  vertex <- if (is.finite(b2) && b2 != 0) -b1 / (2 * b2) else NA_real_
+  tibble(
+    Sample = sample_name, Games = nrow(df),
+    Perfect_ratings = sum(df$pos_share == 1),
+    Quadratic_coefficient = b2,
+    Quadratic_p_value = coef(summary(m))["I(pos_share^2)", "Pr(>|t|)"],
+    Adjusted_R_squared = summary(m)$adj.r.squared,
+    Fitted_peak = ifelse(b2 < 0 && !is.na(vertex) && vertex >= 0 && vertex <= 1,
+                         vertex, NA_real_)
+  )
+}
+
+sensitivity_results <- bind_rows(lapply(names(sensitivity_samples), function(name) {
+  get_sensitivity_stats(sensitivity_samples[[name]], name)
+}))
+knitr::kable(sensitivity_results, digits = 4, caption = "Review-count and perfect-rating sensitivity")
+```
+
+The quadratic coefficient becomes smaller as the minimum review count increases. In the 100+ sample, the quadratic term has p = **0.0932**.
+
+# 10. Model Diagnostics
+
+The main model's residuals show uneven spread and departures from normality.
+
+```{r diagnostics-main, fig.width=8, fig.height=6}
+par(mfrow = c(2, 2))
+plot(m3)
+par(mfrow = c(1, 1))
+```
+
+# 11. Other Observations and Findings
+
+```{r other-observations}
+# Top five ownership midpoints in the EDA sample.
+top_by_owners <- steam_all %>%
+  arrange(desc(owners_mid)) %>%
+  select(Name, `Release date`, price_usd, Positive, Negative, pos_share, owners_mid) %>%
+  head(5)
+knitr::kable(top_by_owners, digits = 3, caption = "Five games with the highest owner midpoint in the EDA sample")
+```
+
+The main sample has **`r format(nrow(steam_main), big.mark = ",")`** games with at least 100 reviews. Its Quadratic + Price model has an adjusted R-squared of **`r sprintf("%.4f", summary(m3)$adj.r.squared)`**, compared with **`r sprintf("%.4f", summary(m3_20)$adj.r.squared)`** for the 20+ review sample. The quadratic term is not significant at the 5% level in the main sample (p = **0.0932**).
+
+The 0.85–0.95 rating bands have similar mean log ownership in the main sample. The 0.95–1.00 band is lower, but there are only five games rated exactly 100%. The breakpoint search also ends at its upper limit, so I did not find a clear diminishing-returns point.
+
+With 100+ reviews, free-to-play games have a median estimated ownership midpoint of **75,000**, compared with **35,000** for paid games. This is a group difference, not an estimate of revenue or the effect of changing a game's price.
+
+Overall, the results are sensitive to the minimum review count. Review score alone is a weak indicator of ownership in the main sample.
+
+# 12. Limitations
+
+Ownership is estimated from broad ranges, not actual sales. The 100+ review cutoff also favours games with more player activity and may exclude smaller or newer titles. Genre, release year and marketing are not included. The residual patterns and selected breakpoint limit how strongly the regression results can be interpreted.
+
+```{r export-summary, include=FALSE}
+report_text <- capture.output({
+  cat("SAMPLE SIZES\n"); print(sample_sizes, n = Inf, width = Inf)
+  cat("\nMODEL COMPARISON\n"); print(model_comparison, n = Inf, width = Inf)
+  cat("\nQUADRATIC RESULTS\n"); print(quadratic_results, n = Inf, width = Inf)
+  cat("\nRATING BANDS\n"); print(rating_summary, n = Inf, width = Inf)
+  cat("\nBREAKPOINTS\n"); print(breakpoint_summary, n = Inf, width = Inf)
+  cat("\nF2P VS PAID\n"); print(segment_summary, n = Inf, width = Inf)
+  cat("\nPRICE GROUP MODELS\n"); print(segment_models, n = Inf, width = Inf)
+  cat("\nPERFECT RATING CHECK\n"); print(rating_check, n = Inf, width = Inf)
+  cat("\nSENSITIVITY CHECK\n"); print(sensitivity_results, n = Inf, width = Inf)
+})
+writeLines(report_text, "steam_results_summary.txt")
+cat("Saved steam_results_summary.txt\n")
+```
